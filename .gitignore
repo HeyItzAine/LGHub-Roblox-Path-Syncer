@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local working notes and machine-specific files
+HANDOFF.md
+LGHUB_backup.zip
+*.zip
+
+# monitor.py output
+before.json
+after.json
+after2.json
+monitor_report*.txt
