@@ -5,11 +5,12 @@ Provides all shared logic for finding paths, reading/writing the LGHUB
 settings database, backup/restore, and LGHUB process management.
 """
 
+import ntpath
+from contextlib import closing
 import sqlite3
 import json
 import shutil
 import subprocess
-import tempfile
 import os
 import uuid
 import time
@@ -79,8 +80,60 @@ def find_lghub_exe() -> Path:
     raise LGHUBNotFoundError("lghub.exe not found in Program Files.")
 
 
+def _running_roblox_player() -> Path | None:
+    """Use the running player's path; prefer the foreground player."""
+    if os.name != "nt":
+        return None
+    command = (
+        "Get-CimInstance Win32_Process -Filter \"Name='RobloxPlayerBeta.exe'\" "
+        "| Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        processes = json.loads(result.stdout)
+        if isinstance(processes, dict):
+            processes = [processes]
+        paths = {}
+        for process in processes:
+            value = process.get("ExecutablePath")
+            if value:
+                path = Path(value)
+                if path.is_file() and path.name.lower() == ROBLOX_EXE_NAME.lower():
+                    paths[int(process["ProcessId"])] = path
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    foreground_pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), ctypes.byref(foreground_pid))
+    if foreground_pid.value in paths:
+        return paths[foreground_pid.value]
+    unique_paths = set(paths.values())
+    if len(unique_paths) == 1:
+        return unique_paths.pop()
+    if len(unique_paths) > 1:
+        raise RobloxNotFoundError(
+            "Multiple Roblox versions are running. Focus the Roblox window "
+            "you want to link, then run the updater again."
+        )
+    return None
+
+
 def find_roblox_player() -> Path:
-    """Find the latest RobloxPlayerBeta.exe in the Roblox Versions folder."""
+    """Find the running Roblox player, or the newest installed executable."""
+    running = _running_roblox_player()
+    if running is not None:
+        return running
     versions_dir = _local_appdata() / "Roblox" / "Versions"
     if not versions_dir.exists():
         raise RobloxNotFoundError(
@@ -116,54 +169,17 @@ def get_backup_dir() -> Path:
 # Database read / write
 # ---------------------------------------------------------------------------
 
-def _copy_db_to_temp(db_path: Path) -> Path:
-    """Copy settings.db + WAL + SHM to a temp directory. Returns temp db path."""
-    tmp = Path(tempfile.mkdtemp(prefix="lghub_"))
-    shutil.copy2(db_path, tmp / db_path.name)
-    for ext in ("-wal", "-shm"):
-        companion = db_path.parent / (db_path.name + ext)
-        if companion.exists():
-            shutil.copy2(companion, tmp / (db_path.name + ext))
-    return tmp / db_path.name
+def read_settings_raw(db_path: Path) -> bytes:
+    """Read one consistent SQLite snapshot without copying live WAL files."""
+    with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as conn:
+        row = conn.execute("SELECT file FROM data WHERE _id = 1").fetchone()
+    if row is None:
+        raise LGHUBError("No settings row found.")
+    return row[0] if isinstance(row[0], bytes) else row[0].encode("utf-8")
 
 
 def read_settings_json(db_path: Path) -> dict:
-    """
-    Read the JSON blob from the data table in settings.db.
-    Copies the DB first to avoid lock conflicts with running LGHUB.
-    """
-    tmp_db = _copy_db_to_temp(db_path)
-    try:
-        conn = sqlite3.connect(str(tmp_db))
-        cursor = conn.execute("SELECT file FROM data WHERE _id = 1")
-        row = cursor.fetchone()
-        conn.close()
-        if row is None:
-            raise LGHUBError("No data found in settings.db (data table is empty).")
-        blob = row[0]
-        if isinstance(blob, bytes):
-            return json.loads(blob.decode("utf-8"))
-        return json.loads(blob)
-    finally:
-        # Clean up temp files
-        tmp_dir = tmp_db.parent
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
-def read_settings_raw(db_path: Path) -> bytes:
-    """Read the raw blob bytes from the data table (for hashing / diffing)."""
-    tmp_db = _copy_db_to_temp(db_path)
-    try:
-        conn = sqlite3.connect(str(tmp_db))
-        cursor = conn.execute("SELECT file FROM data WHERE _id = 1")
-        row = cursor.fetchone()
-        conn.close()
-        if row is None:
-            raise LGHUBError("No data found in settings.db.")
-        blob = row[0]
-        return blob if isinstance(blob, bytes) else blob.encode("utf-8")
-    finally:
-        shutil.rmtree(tmp_db.parent, ignore_errors=True)
+    return json.loads(read_settings_raw(db_path))
 
 
 def write_settings_json(db_path: Path, data: dict) -> None:
@@ -190,30 +206,28 @@ def write_settings_json(db_path: Path, data: dict) -> None:
 
 def create_backup(db_path: Path, backup_dir: Path | None = None) -> Path:
     """
-    Create a timestamped backup of settings.db (+ WAL/SHM) and a
-    human-readable JSON dump. Returns the path to the backup .db file.
+    Create a consistent SQLite snapshot and a JSON dump of that snapshot. Returns the path to the backup .db file.
     """
     if backup_dir is None:
         backup_dir = get_backup_dir()
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_db = backup_dir / f"settings_{ts}.db"
-
-    shutil.copy2(db_path, backup_db)
-    for ext in ("-wal", "-shm"):
-        companion = db_path.parent / (db_path.name + ext)
-        if companion.exists():
-            shutil.copy2(companion, backup_dir / f"settings_{ts}.db{ext}")
-
-    # Also save human-readable JSON
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_db = backup_dir / f"settings_{ts}_{uuid.uuid4().hex[:8]}.db"
+    deadline = time.monotonic() + 15
+    def progress(status, remaining, total):
+        if time.monotonic() > deadline:
+            raise LGHUBError("Timed out creating a consistent backup.")
     try:
-        settings = read_settings_json(db_path)
-        json_path = backup_dir / f"settings_{ts}.json"
-        json_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+        with closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as source:
+            with closing(sqlite3.connect(backup_db)) as target:
+                source.backup(target, pages=256, progress=progress, sleep=0.05)
+        settings = read_settings_json(backup_db)
+        backup_db.with_suffix(".json").write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
-        pass  # JSON dump is a bonus, don't fail the backup
-
+        backup_db.unlink(missing_ok=True)
+        backup_db.with_suffix(".json").unlink(missing_ok=True)
+        raise
     return backup_db
 
 
@@ -263,9 +277,11 @@ def is_lghub_running() -> bool:
             ["tasklist", "/FI", "IMAGENAME eq lghub_agent.exe"],
             capture_output=True, text=True, timeout=10
         )
+        if result.returncode != 0:
+            raise LGHUBError("Unable to determine G HUB process state.")
         return "lghub_agent.exe" in result.stdout.lower()
-    except Exception:
-        return False
+    except Exception as e:
+        raise LGHUBError("Unable to determine G HUB process state.") from e
 
 
 def stop_lghub(timeout: int = 10) -> bool:
@@ -327,13 +343,47 @@ def start_lghub(timeout: int = 20) -> bool:
 
 def get_current_roblox_app(settings: dict) -> dict | None:
     """Find the Roblox application entry in the settings JSON."""
-    apps = settings.get("applications", {}).get("applications", [])
-    for app in apps:
-        name = app.get("name", "").lower()
-        path = app.get("applicationPath", "").lower()
-        if "roblox" in name or "roblox" in path:
-            return app
-    return None
+    return select_roblox_app(settings.get("applications", {}).get("applications", []))
+
+
+def select_roblox_app(apps, application_id=None):
+    if application_id is not None:
+        matches = [a for a in apps if a.get("applicationId") == application_id]
+    else:
+        matches = [a for a in apps if any(
+            ntpath.basename(p).lower() == ROBLOX_EXE_NAME.lower()
+            for p in [a.get("applicationPath", "")] + a.get("userPaths", [])
+        )]
+        if not matches:
+            matches = [a for a in apps if a.get("name", "").lower() in ("roblox", "robloxplayerbeta")]
+    if len(matches) > 1:
+        raise LGHUBError("Multiple Roblox application entries match; resolve duplicates in G HUB.")
+    return matches[0] if matches else None
+
+
+def exact_user_paths(app, application_id, new_path):
+    return bool(app and app.get("applicationId") == application_id
+                and len(app.get("userPaths", [])) == 1
+                and _same_path(app["userPaths"][0], new_path))
+
+
+def update_offline(db_path, application_id, new_path):
+    """Reread and patch only the selected app under one write transaction."""
+    if is_lghub_running():
+        raise DatabaseLockedError("G HUB must be stopped for offline updates.")
+    with closing(sqlite3.connect(db_path, timeout=5)) as conn:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT file FROM data WHERE _id=1").fetchone()
+            if row is None:
+                raise LGHUBError("No settings row found.")
+            settings = json.loads(row[0])
+            app = select_roblox_app(settings.get("applications", {}).get("applications", []), application_id)
+            if app is None:
+                raise LGHUBError("Selected application no longer exists.")
+            app["applicationPath"] = new_path
+            app["userPaths"] = [new_path]
+            conn.execute("UPDATE data SET file=? WHERE _id=1", (json.dumps(settings).encode("utf-8"),))
 
 
 def get_roblox_profile(settings: dict, app_id: str) -> dict | None:
@@ -346,7 +396,7 @@ def get_roblox_profile(settings: dict, app_id: str) -> dict | None:
 
 
 def _same_path(a: str, b: str) -> bool:
-    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+    return ntpath.normcase(ntpath.normpath(a)) == ntpath.normcase(ntpath.normpath(b))
 
 
 def desired_user_paths(existing_user_paths: list[str], new_exe_path: str) -> list[str]:

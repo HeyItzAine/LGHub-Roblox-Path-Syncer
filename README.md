@@ -10,8 +10,8 @@ Roblox installs every update into a fresh folder: `%LOCALAPPDATA%\Roblox\Version
 
 `auto_update.py` (or the `.bat` wrapper) runs three steps:
 
-1. Finds the newest `RobloxPlayerBeta.exe` under `%LOCALAPPDATA%\Roblox\Versions`, picked by file modification time.
-2. Backs up `settings.db` (with its WAL/SHM companions and a readable JSON dump) to `%LOCALAPPDATA%\LGHUB\backups`.
+1. Uses the running `RobloxPlayerBeta.exe`. If multiple versions are running, it uses the foreground Roblox window; focus that window before running the tool. When Roblox is closed, it picks the newest executable under `%LOCALAPPDATA%\Roblox\Versions` by file modification time.
+2. Creates a consistent SQLite backup of `settings.db` and a JSON dump from the same snapshot to `%LOCALAPPDATA%\LGHUB\backups`.
 3. Links the new exe to your existing Roblox entry in G HUB.
 
 If the path is already current, it exits with code 2 and writes nothing.
@@ -27,11 +27,7 @@ If the path is already current, it exits with code 2 and writes nothing.
 
 **1. Download the tool**
 
-```
-git clone https://github.com/HeyItzAine/LGHub-Roblox-Path-Syncer.git
-```
-
-Or click Code > Download ZIP on GitHub and extract it. Any folder works; the scripts locate G HUB and Roblox through environment variables, not their own location.
+Download the repository using Code > Download ZIP and extract it. Any folder works; the scripts locate G HUB and Roblox through environment variables.
 
 **2. Add Roblox to G HUB (first time only)**
 
@@ -68,7 +64,7 @@ python interactive.py
 
 ## Backups and restore
 
-Every run that changes something first copies `settings.db` to `%LOCALAPPDATA%\LGHUB\backups\settings_<timestamp>.db`, alongside a `.json` dump you can read in a text editor. To roll back, run `interactive.py`, pick option 5, and choose a backup. Restore stops G HUB, copies the files back, and offers to start it again.
+Every run that changes something first snapshots `settings.db` to `%LOCALAPPDATA%\LGHUB\backups\settings_<timestamp>.db`, alongside a `.json` dump you can read in a text editor. To roll back, run `interactive.py`, pick option 5, and choose a backup. Restore stops G HUB, copies the files back, and offers to start it again.
 
 ## Files
 
@@ -78,5 +74,14 @@ Every run that changes something first copies `settings.db` to `%LOCALAPPDATA%\L
 | `interactive.py` | Menu: sync, manual path, view config, backup, restore |
 | `sync_roblox_path.bat` | Double-click wrapper for `auto_update.py` |
 | `agent_api.py` | Websocket client for the G HUB agent on port 9010 |
+| `sync_service.py` | Shared live-first update and persistence verification |
 | `core.py` | Path discovery, `settings.db` read/write, backups, process control |
 | `monitor.py` | Dev tool that diffs G HUB config before and after a manual UI change |
+
+## Update reliability
+
+Both entry points read the agent first, select the player executable precisely, and reject ambiguous application entries. The linked list remains exactly one current executable. Live replies and persisted settings are checked against the selected application ID and exact linked list.
+
+Transient connection failures are retried. After an uncertain SET, the client reconnects and reads back before resending. Rejected requests and uncertain writes never trigger a direct database write. Offline updates are allowed only when the agent is stopped; they reread settings inside a transaction and patch only the existing application. The updater no longer force-stops G HUB after an API failure.
+
+Backups use SQLite's backup API, including committed WAL state, with unique filenames. Separate WAL/SHM copies are unnecessary for new backups. The JSON companion is derived from the backup itself. A live update whose database persistence cannot yet be confirmed is reported explicitly.

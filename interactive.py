@@ -11,6 +11,7 @@ from pathlib import Path
 
 import agent_api
 import core
+import sync_service
 
 
 def show_status(db_path: Path):
@@ -30,15 +31,18 @@ def show_status(db_path: Path):
     except Exception:
         latest_path = "Not found"
 
-    if core.is_lghub_running():
-        lghub_status = "Running (agent API available)" if agent_api.agent_available() else "Running"
-    else:
-        lghub_status = "Stopped"
+    try:
+        if core.is_lghub_running():
+            lghub_status = "Running (agent API available)" if agent_api.agent_available() else "Running"
+        else:
+            lghub_status = "Stopped"
+    except core.LGHUBError:
+        lghub_status = "Unknown (process check failed)"
 
     print(f"  Current LGHUB Roblox path: {current_path}")
     for p in linked:
         print(f"  Linked executable:         {p}")
-    print(f"  Detected latest Roblox:    {latest_path}")
+    print(f"  Detected target Roblox:    {latest_path}")
     print(f"  LGHUB Status:              {lghub_status}")
     print()
 
@@ -52,29 +56,9 @@ def handle_auto_update(db_path: Path):
         return
 
     new_path = str(roblox_exe).replace("/", "\\")
-    settings = core.read_settings_json(db_path)
-    current = core.get_current_roblox_app(settings)
-    current_path = current.get("applicationPath", "N/A") if current else "Not configured"
-
-    print(f"  Current: {current_path}")
-    print(f"  New:     {new_path}")
-
-    if current is not None:
-        user_paths = current.get("userPaths", [])
-        desired = core.desired_user_paths(user_paths, new_path)
-        userpaths_clean = (
-            len(desired) == len(user_paths)
-            and all(core._same_path(a, b) for a, b in zip(desired, user_paths))
-        )
-        if core.roblox_path_effective(current, new_path) and userpaths_clean:
-            print("  Already up to date!")
-            return
-
-    confirm = input("  Proceed? (Y/n): ").strip().lower()
-    if confirm == "n":
-        return
-
-    _do_update(db_path, settings, new_path)
+    print(f"  Target: {new_path}")
+    if input("  Proceed? (Y/n): ").strip().lower() != "n":
+        _do_update(db_path, new_path)
 
 
 def handle_manual_path(db_path: Path):
@@ -95,69 +79,15 @@ def handle_manual_path(db_path: Path):
             return
 
     new_path = str(exe_path).replace("/", "\\")
-    settings = core.read_settings_json(db_path)
-    _do_update(db_path, settings, new_path)
+    _do_update(db_path, new_path)
 
 
-def _do_update(db_path: Path, settings: dict, new_path: str):
-    """Shared update logic: backup, then live update via the agent API if
-    LGHUB is running (no restart), else direct DB write."""
-    print("  Creating backup...")
-    backup_path = core.create_backup(db_path)
-    print(f"  Backup: {backup_path}")
-
-    # Preferred: live update through the lghub_agent websocket (port 9010).
-    # Links the new exe via userPaths; the agent persists to settings.db
-    # itself, so LGHUB never has to stop.
-    if agent_api.agent_available():
-        print("  LGHUB agent is running - updating live (no restart needed)...")
-        try:
-            result = agent_api.live_update_roblox(new_path)
-            print(f"  Linked paths now: {result['userPaths']}")
-            if result["note"]:
-                print(f"  Note: {result['note']}")
-            print("  Config updated successfully!")
-            return
-        except agent_api.AgentError as e:
-            print(f"  Live update failed: {e}")
-            print("  Falling back to offline update...")
-
-    if core.is_lghub_running():
-        print("  LGHUB must be stopped to update the config.")
-        stop_confirm = input("  Stop LGHUB? (Y/n): ").strip().lower()
-        if stop_confirm == "n":
-            print("  Cancelled (LGHUB must be stopped).")
-            return
-        print("  Stopping LGHUB...")
-        if not core.stop_lghub():
-            print("  Error: Failed to stop LGHUB.")
-            return
-        print("  LGHUB stopped.")
-
-        settings = core.update_roblox_path(settings, new_path)
-        try:
-            core.write_settings_json(db_path, settings)
-            print("  Config updated successfully!")
-        except Exception as e:
-            print(f"  Error: {e}")
-            print(f"  Restore from backup: {backup_path}")
-            return
-
-        restart = input("  Start LGHUB? (Y/n): ").strip().lower()
-        if restart != "n":
-            print("  Starting LGHUB...")
-            if core.start_lghub():
-                print("  LGHUB started.")
-            else:
-                print("  Could not start LGHUB. Please start it manually.")
-    else:
-        settings = core.update_roblox_path(settings, new_path)
-        try:
-            core.write_settings_json(db_path, settings)
-            print("  Config updated successfully!")
-        except Exception as e:
-            print(f"  Error: {e}")
-            print(f"  Restore from backup: {backup_path}")
+def _do_update(db_path: Path, new_path: str):
+    """Use the same verified update flow as automatic mode."""
+    try:
+        print("  " + sync_service.describe(sync_service.sync_path(db_path, new_path)))
+    except Exception as e:
+        print(f"  Update failed: {e}")
 
 
 def handle_view_config(db_path: Path):
@@ -280,7 +210,7 @@ def main():
         print("=" * 50)
         show_status(db_path)
 
-        print("  1. Auto-update Roblox path (detect latest)")
+        print("  1. Auto-update Roblox path (detect running or newest)")
         print("  2. Manually set Roblox path")
         print("  3. View current LGHUB Roblox config")
         print("  4. Create backup")

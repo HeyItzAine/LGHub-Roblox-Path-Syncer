@@ -12,3 +12,16 @@ before.json
 after.json
 after2.json
 monitor_report*.txt
+
+# Local configuration and scratch data
+.env
+.env.*
+!.env.example
+*.log
+*.db
+*.db-wal
+*.db-shm
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

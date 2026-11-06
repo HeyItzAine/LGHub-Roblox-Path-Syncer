@@ -1,32 +1,7 @@
-"""
-LGHUB Agent Websocket API - live config editing without stopping LGHUB.
+"""Local G HUB WebSocket client with correlated requests and exact path readback."""
 
-lghub_agent.exe serves a JSON-protobuf websocket API on 127.0.0.1:9010 (the
-same one the G HUB UI uses). Messages look like:
-
-    {"msgId": "<uuid>", "verb": "GET|SET|POST|DELETE", "path": "/applications",
-     "payload": {"@type": "type.googleapis.com/logi.protocol...", ...}}
-
-Responses echo the msgId. Unsolicited broadcasts arrive on the same socket and
-must be skipped while waiting for a reply.
-
-Key facts discovered by probing (2026-07-16):
-- GET /applications returns the full app list, including custom entries.
-- SET /application accepts a partial Application payload and merges it by
-  applicationId. `userPaths` is writable; `applicationPath` is READ-ONLY and
-  silently ignored.
-- `userPaths` is G HUB's official "link additional executables" feature: the
-  agent matches running processes against applicationPath AND every userPaths
-  entry (verified live: a linked exe was associated within ~3s of launch).
-- Changes made through SET are persisted to settings.db by the agent itself
-  within ~1 second, while LGHUB keeps running.
-
-So to keep a profile working across Roblox updates we only need to keep the
-newest RobloxPlayerBeta.exe present in userPaths. No LGHUB restart required.
-
-Pure stdlib (socket-level websocket client) - no pip dependencies.
-"""
-
+import core
+import functools
 import base64
 import json
 import os
@@ -44,8 +19,28 @@ class AgentError(Exception):
     """Base error for agent API operations."""
 
 
+class AgentRejected(AgentError):
+    """The agent rejected a request; do not retry as an offline write."""
+
+
+class AgentProtocolError(AgentError):
+    """The response is malformed or inconsistent."""
+
+
 class AgentUnavailable(AgentError):
     """The lghub_agent websocket is not reachable (LGHUB not running?)."""
+
+
+def transport_errors(method):
+    @functools.wraps(method)
+    def wrapped(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except (ValueError, UnicodeError) as e:
+            raise AgentProtocolError("Malformed agent response.") from e
+        except OSError as e:
+            raise AgentUnavailable("Agent communication interrupted.") from e
+    return wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -63,8 +58,13 @@ class AgentConnection:
             raise AgentUnavailable(f"Cannot reach LGHUB agent at {host}:{port}: {e}") from e
         self._sock.settimeout(timeout)
         self._buf = b""
-        self._handshake(host, port)
+        try:
+            self._handshake(host, port)
+        except Exception:
+            self._sock.close()
+            raise
 
+    @transport_errors
     def _handshake(self, host: str, port: int) -> None:
         key = base64.b64encode(os.urandom(16)).decode()
         request = (
@@ -95,9 +95,14 @@ class AgentConnection:
 
     def _recv_exact(self, n: int) -> bytes:
         while len(self._buf) < n:
+            if getattr(self, "_deadline", None) is not None:
+                remaining = self._deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AgentUnavailable("Agent request timed out.")
+                self._sock.settimeout(remaining)
             chunk = self._sock.recv(65536)
             if not chunk:
-                raise AgentError("Connection closed by agent.")
+                raise AgentUnavailable("Connection closed by agent.")
             self._buf += chunk
         data, self._buf = self._buf[:n], self._buf[n:]
         return data
@@ -147,7 +152,7 @@ class AgentConnection:
             if opcode == 0xA:            # pong
                 continue
             if opcode == 0x8:            # close
-                raise AgentError("Agent closed the websocket.")
+                raise AgentUnavailable("Agent closed the websocket.")
             if opcode in (0x1, 0x2):     # text/binary start
                 parts = [data]
                 have_start = True
@@ -156,6 +161,7 @@ class AgentConnection:
             if fin and have_start:
                 return b"".join(parts).decode("utf-8")
 
+    @transport_errors
     def request(self, verb: str, path: str, payload: dict | None = None,
                 timeout: float | None = None) -> dict:
         """Send a request and wait for the msgId-matched response,
@@ -165,15 +171,19 @@ class AgentConnection:
         if payload is not None:
             msg["payload"] = payload
         self.send_text(json.dumps(msg))
-        deadline = time.time() + (timeout or self.timeout)
-        while time.time() < deadline:
+        deadline = time.monotonic() + (timeout or self.timeout)
+        self._deadline = deadline
+        while time.monotonic() < deadline:
             try:
+                self._sock.settimeout(max(0.01, deadline - time.monotonic()))
                 resp = json.loads(self.recv_text())
-            except socket.timeout:
-                continue
+                if not isinstance(resp, dict):
+                    raise AgentProtocolError("Expected an object response.")
+            except socket.timeout as e:
+                raise AgentUnavailable("Agent request timed out.") from e
             if resp.get("msgId") == msg_id:
                 return resp
-        raise AgentError(f"No response to {verb} {path} within timeout.")
+        raise AgentUnavailable(f"No response to {verb} {path} within timeout.")
 
     def close(self) -> None:
         try:
@@ -213,16 +223,12 @@ def get_applications(conn: AgentConnection) -> list[dict]:
     resp = conn.request("GET", "/applications")
     result = resp.get("result", {})
     if result.get("code") != "SUCCESS":
-        raise AgentError(f"GET /applications failed: {result}")
+        raise AgentRejected(f"GET /applications failed: {result}")
     return resp.get("payload", {}).get("applications", [])
 
 
-def find_roblox_app(conn: AgentConnection) -> dict | None:
-    for app in get_applications(conn):
-        hay = (app.get("name", "") + app.get("applicationPath", "")).lower()
-        if "roblox" in hay:
-            return app
-    return None
+def find_roblox_app(conn, application_id=None):
+    return core.select_roblox_app(get_applications(conn), application_id)
 
 
 def compute_desired_user_paths(app: dict, new_path: str) -> list[str]:
@@ -242,7 +248,7 @@ def set_user_paths(conn: AgentConnection, application_id: str, user_paths: list[
     resp = conn.request("SET", "/application", payload)
     result = resp.get("result", {})
     if result.get("code") != "SUCCESS":
-        raise AgentError(f"SET /application failed: {result}")
+        raise AgentRejected(f"SET /application failed: {result}")
 
 
 def is_path_effective(app: dict, exe_path: str) -> bool:
@@ -252,54 +258,33 @@ def is_path_effective(app: dict, exe_path: str) -> bool:
     return any(_same_path(p, exe_path) for p in app.get("userPaths", []))
 
 
-def live_update_roblox(new_path: str) -> dict:
-    """
-    Ensure the newest Roblox exe is linked to the LGHUB Roblox entry, live.
-
-    Returns a summary dict:
-      {"changed": bool, "applicationId": ..., "applicationPath": ...,
-       "userPaths": [...], "note": ...}
-    Raises AgentUnavailable if the agent isn't running, AgentError on API
-    failure - callers should fall back to the offline (stop/write/start) path.
-    """
-    new_path = str(new_path).replace("/", "\\")
-    with AgentConnection() as conn:
-        app = find_roblox_app(conn)
-        if app is None:
-            raise AgentError("No Roblox entry found in LGHUB (add it once via G HUB UI).")
-
-        desired = compute_desired_user_paths(app, new_path)
-        current = app.get("userPaths", [])
-        already = (
-            len(desired) == len(current)
-            and all(_same_path(a, b) for a, b in zip(desired, current))
-        )
-        if already and is_path_effective(app, new_path):
-            return {
-                "changed": False,
-                "applicationId": app["applicationId"],
-                "applicationPath": app.get("applicationPath", ""),
-                "userPaths": current,
-                "note": "Already up to date.",
-            }
-
-        set_user_paths(conn, app["applicationId"], desired)
-
-        # Read back to confirm the agent accepted the change
-        updated = find_roblox_app(conn)
-        if updated is None or not is_path_effective(updated, new_path):
-            raise AgentError("Agent did not accept the userPaths update.")
-
-        note = ""
-        if not _same_path(updated.get("applicationPath", ""), new_path):
-            note = (
-                "applicationPath is read-only via the live API and may point at an "
-                "old version folder; detection works through the linked userPaths."
-            )
-        return {
-            "changed": True,
-            "applicationId": updated["applicationId"],
-            "applicationPath": updated.get("applicationPath", ""),
-            "userPaths": updated.get("userPaths", []),
-            "note": note,
-        }
+def live_update_roblox(new_path, application_id=None, before_write=None):
+    """Retry transport failures, reconciling state before resending SET."""
+    changed = False
+    prepared = False
+    for attempt in range(3):
+        try:
+            with AgentConnection() as conn:
+                app = find_roblox_app(conn, application_id)
+                if app is None:
+                    raise AgentRejected("No matching Roblox application; add it in G HUB first.")
+                application_id = app["applicationId"]
+                if core.exact_user_paths(app, application_id, new_path):
+                    return {"changed": changed, "applicationId": application_id,
+                            "userPaths": app["userPaths"], "note": ""}
+                if before_write and not prepared:
+                    before_write()
+                    prepared = True
+                changed = True
+                set_user_paths(conn, application_id, [new_path])
+                updated = find_roblox_app(conn, application_id)
+                if not core.exact_user_paths(updated, application_id, new_path):
+                    raise AgentProtocolError("Agent did not retain the exact linked path list.")
+                return {"changed": True, "applicationId": application_id,
+                        "userPaths": updated["userPaths"], "note": ""}
+        except AgentUnavailable:
+            if attempt == 2:
+                if changed:
+                    raise AgentError("Update outcome is uncertain; rerun to reconcile. No offline write performed.")
+                raise
+            time.sleep(0.25 * (attempt + 1))
